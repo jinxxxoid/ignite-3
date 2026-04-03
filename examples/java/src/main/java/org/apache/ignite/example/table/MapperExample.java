@@ -90,8 +90,7 @@ public class MapperExample {
 
             Person myPerson = new Person(2, "2", "John Doe", 40, "Apache");
 
-                view.upsert(myPerson);
-            } finally {
+            view.upsert(myPerson);
 
             System.out.println("Dropping the table...");
 
