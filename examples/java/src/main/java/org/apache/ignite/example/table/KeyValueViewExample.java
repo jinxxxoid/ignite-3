@@ -80,7 +80,7 @@ public class KeyValueViewExample {
                     .set("accountNumber", 123456);
 
             Tuple value = Tuple.create()
-                    .set("firstName", "John")
+                    .set("firstName", "Jane")
                     .set("lastName", "Doe")
                     .set("balance", 100.00d);
 

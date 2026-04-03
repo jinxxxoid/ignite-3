@@ -80,7 +80,7 @@ public class KeyValueViewPojoExample {
             AccountKey key = new AccountKey(123456);
 
             Account value = new Account(
-                    "John",
+                    "Jane",
                     "Doe",
                     100.00d
             );

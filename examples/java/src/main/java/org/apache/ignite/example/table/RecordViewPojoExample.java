@@ -79,7 +79,7 @@ public class RecordViewPojoExample {
 
             Account newAccount = new Account(
                     123456,
-                    "John",
+                    "Jane",
                     "Doe",
                     100.00d
             );
