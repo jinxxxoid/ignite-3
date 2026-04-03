@@ -25,7 +25,8 @@ COMMON_JAVA_OPTS="
     -Dio.netty.tryReflectionSetAccessible=true \
     -Dfile.encoding=UTF-8 \
     -XX:+HeapDumpOnOutOfMemoryError \
-    -XX:+ExitOnOutOfMemoryError"
+    -XX:+ExitOnOutOfMemoryError \
+    -XX:+PerfDisableSharedMem"
 
 LOGGING_JAVA_OPTS="
     -Djava.util.logging.config.file=${CONF_DIR}/ignite.java.util.logging.properties \
@@ -63,4 +64,5 @@ export JAVA_CMD_WITH_ARGS="${JAVACMD} \
 export APPLICATION_ARGS="\
   --config-path ${CONFIG_FILE} \
   --work-dir ${WORK_DIR} \
-  --node-name ${NODE_NAME}"
+  --node-name ${NODE_NAME} \
+  --log-dir ${LOG_DIR}"

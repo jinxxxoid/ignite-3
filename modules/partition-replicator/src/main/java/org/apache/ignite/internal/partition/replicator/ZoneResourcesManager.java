@@ -28,6 +28,7 @@ import java.util.concurrent.Executor;
 import org.apache.ignite.internal.catalog.CatalogService;
 import org.apache.ignite.internal.close.ManuallyCloseable;
 import org.apache.ignite.internal.failure.FailureProcessor;
+import org.apache.ignite.internal.hlc.ClockService;
 import org.apache.ignite.internal.network.TopologyService;
 import org.apache.ignite.internal.partition.replicator.raft.ZonePartitionRaftListener;
 import org.apache.ignite.internal.partition.replicator.raft.snapshot.LogStorageAccessImpl;
@@ -71,6 +72,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
 
     private final ReplicaManager replicaManager;
 
+    private final ClockService clockService;
+
     private final RaftSnapshotsMetricsSource snapshotsMetricsSource = new RaftSnapshotsMetricsSource();
 
     /** Map from zone IDs to their resource holders. */
@@ -86,7 +89,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
             CatalogService catalogService,
             FailureProcessor failureProcessor,
             Executor partitionOperationsExecutor,
-            ReplicaManager replicaManager
+            ReplicaManager replicaManager,
+            ClockService clockService
     ) {
         this.sharedTxStateStorage = sharedTxStateStorage;
         this.txManager = txManager;
@@ -96,6 +100,7 @@ public class ZoneResourcesManager implements ManuallyCloseable {
         this.failureProcessor = failureProcessor;
         this.partitionOperationsExecutor = partitionOperationsExecutor;
         this.replicaManager = replicaManager;
+        this.clockService = clockService;
     }
 
     ZonePartitionResources allocateZonePartitionResources(
@@ -119,7 +124,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
                 safeTimeTracker,
                 storageIndexTracker,
                 outgoingSnapshotsManager,
-                partitionOperationsExecutor
+                partitionOperationsExecutor,
+                clockService
         );
 
         var snapshotStorage = new PartitionSnapshotStorage(
@@ -192,6 +198,19 @@ public class ZoneResourcesManager implements ManuallyCloseable {
         });
     }
 
+    /**
+     * Removes partition resources from the zone. It is safe to do so since resources should've been closed on before node stop event.
+     */
+    void removeZonePartitionResources(ZonePartitionId zonePartitionId) {
+        inBusyLock(busyLock, () -> {
+            ZoneResources resources = resourcesByZoneId.get(zonePartitionId.zoneId());
+
+            if (resources != null) {
+                resources.resourcesByPartitionId.remove(zonePartitionId.partitionId());
+            }
+        });
+    }
+
     CompletableFuture<Void> removeTableResources(ZonePartitionId zonePartitionId, int tableId) {
         ZonePartitionResources resources = getZonePartitionResources(zonePartitionId);
 
@@ -211,8 +230,8 @@ public class ZoneResourcesManager implements ManuallyCloseable {
 
     /**
      *  Returns future of true if there are no corresponding table-related resources, otherwise awaits replicaListenerFuture
-     *  and checks whether table replica processors, table raft processors and partition snapshot storages are present.
-     *  if any is present, returns false, otherwise returns true.
+     *  and checks whether table replica processors, table raft processors, and partition snapshot storages are present.
+     *  If any is present, returns {@code false}, otherwise returns {@code true}.
      */
     CompletableFuture<Boolean> areTableResourcesEmpty(ZonePartitionId zonePartitionId) {
         ZonePartitionResources resources = getZonePartitionResources(zonePartitionId);
@@ -302,7 +321,7 @@ public class ZoneResourcesManager implements ManuallyCloseable {
             return txStatePartitionStorage;
         }
 
-        public boolean txStatePartitionStorageIsInRebalanceState() {
+        boolean txStatePartitionStorageIsInRebalanceState() {
             return txStatePartitionStorage.lastAppliedIndex() == TxStatePartitionStorage.REBALANCE_IN_PROGRESS;
         }
 
@@ -323,7 +342,7 @@ public class ZoneResourcesManager implements ManuallyCloseable {
         }
 
         /** Closes trackers. */
-        public void closeTrackers() {
+        void closeTrackers() {
             safeTimeTracker.close();
             storageIndexTracker.close();
         }
@@ -331,7 +350,6 @@ public class ZoneResourcesManager implements ManuallyCloseable {
         /** Closes all resources. */
         public void close() {
             closeTrackers();
-            raftListener.onShutdown();
             txStatePartitionStorage.close();
         }
     }
