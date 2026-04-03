@@ -17,7 +17,6 @@
 
 package org.apache.ignite.internal.compute;
 
-import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static org.apache.ignite.compute.JobStatus.CANCELED;
@@ -50,6 +49,7 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.in;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -73,11 +73,9 @@ import org.apache.ignite.Ignite;
 import org.apache.ignite.compute.BroadcastExecution;
 import org.apache.ignite.compute.BroadcastJobTarget;
 import org.apache.ignite.compute.ComputeException;
-import org.apache.ignite.compute.ComputeJob;
 import org.apache.ignite.compute.IgniteCompute;
 import org.apache.ignite.compute.JobDescriptor;
 import org.apache.ignite.compute.JobExecution;
-import org.apache.ignite.compute.JobExecutionContext;
 import org.apache.ignite.compute.JobExecutionOptions;
 import org.apache.ignite.compute.JobTarget;
 import org.apache.ignite.compute.TaskDescriptor;
@@ -96,6 +94,7 @@ import org.apache.ignite.table.QualifiedName;
 import org.apache.ignite.table.Tuple;
 import org.apache.ignite.table.mapper.Mapper;
 import org.apache.ignite.table.partition.Partition;
+import org.example.jobs.embedded.ObservableTimestampResult;
 import org.hamcrest.Matcher;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.BeforeEach;
@@ -512,7 +511,7 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
         CancelHandle cancelHandle = CancelHandle.create();
 
         CompletableFuture<Void> execution = compute()
-                .executeAsync(JobTarget.node(clusterNode(executeNode)), silentSleepJob(), 100L, cancelHandle.token());
+                .executeAsync(JobTarget.node(clusterNode(executeNode)), cancelAwareSleepJob(), 100L, cancelHandle.token());
 
         cancelHandle.cancel();
 
@@ -527,7 +526,7 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
         CancelHandle cancelHandle = CancelHandle.create();
 
         CompletableFuture<Void> runFut = IgniteTestUtils.runAsync(() -> compute()
-                .execute(JobTarget.node(clusterNode(executeNode)), silentSleepJob(), 100L, cancelHandle.token()));
+                .execute(JobTarget.node(clusterNode(executeNode)), cancelAwareSleepJob(), 100L, cancelHandle.token()));
 
         cancelHandle.cancel();
 
@@ -545,7 +544,7 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
 
         CompletableFuture<Collection<Void>> resultsFut = compute().executeAsync(
                 BroadcastJobTarget.nodes(executeNodes),
-                silentSleepJob(), 100L, cancelHandle.token()
+                cancelAwareSleepJob(), 100L, cancelHandle.token()
         );
 
         cancelHandle.cancel();
@@ -564,7 +563,7 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
 
         CompletableFuture<Collection<Void>> runFut = IgniteTestUtils.runAsync(() -> compute().execute(
                 BroadcastJobTarget.nodes(executeNodes),
-                silentSleepJob(), 100L, cancelHandle.token()
+                cancelAwareSleepJob(), 100L, cancelHandle.token()
         ));
 
         cancelHandle.cancel();
@@ -680,7 +679,7 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
         // RuntimeException is thrown when SleepJob catches the InterruptedException
         assertThat(runtimeException.toString(), containsString(InterruptedException.class.getName()));
 
-        await().until(execution::stateAsync, willBe(jobStateWithStatus(CANCELED)));
+        await().until(execution::stateAsync, willBe(jobStateWithStatus(FAILED)));
     }
 
     @ParameterizedTest
@@ -699,19 +698,10 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
 
         assertThat(cancelHandle.cancelAsync(), willCompleteSuccessfully());
 
-        CompletionException completionException = assertThrows(CompletionException.class, () -> execution.resultAsync().join());
+        // Job ignores cancellation and completes normally — cooperative cancellation means the result is honored.
+        assertThat(execution.resultAsync(), willBe(nullValue()));
 
-        // Unwrap CompletionException, ComputeException should be the cause thrown from the API
-        assertThat(completionException.getCause(), instanceOf(ComputeException.class));
-        ComputeException computeException = (ComputeException) completionException.getCause();
-
-        // ComputeException should be caused by the CancellationException thrown from the executor which detects that the job completes,
-        // but was previously cancelled
-        assertThat(computeException.getCause(), instanceOf(CancellationException.class));
-        CancellationException cancellationException = (CancellationException) computeException.getCause();
-        assertThat(cancellationException.getCause(), is(nullValue()));
-
-        await().until(execution::stateAsync, willBe(jobStateWithStatus(CANCELED)));
+        await().until(execution::stateAsync, willBe(jobStateWithStatus(COMPLETED)));
     }
 
     @ParameterizedTest
@@ -739,7 +729,31 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
 
         // Cancel running task
         assertThat(cancelHandle1.cancelAsync(), willCompleteSuccessfully());
-        await().until(execution1::stateAsync, willBe(jobStateWithStatus(CANCELED)));
+        await().until(execution1::stateAsync, willBe(jobStateWithStatus(FAILED)));
+    }
+
+    @ParameterizedTest(name = "local: {0}")
+    @ValueSource(booleans = {true, false})
+    void asyncJobCompletesNormallyAfterCooperativeCancellation(boolean local) {
+        Ignite executeNode = local ? node(0) : node(1);
+
+        CancelHandle cancelHandle = CancelHandle.create();
+
+        JobExecution<String> execution = submit(
+                JobTarget.node(clusterNode(executeNode)),
+                asyncDelayedCompleteJob(),
+                cancelHandle.token(),
+                null
+        );
+
+        await().until(execution::stateAsync, willBe(jobStateWithStatus(EXECUTING)));
+
+        cancelHandle.cancel();
+
+        // The async job detects cancellation via isCancelled(), does cleanup, then completes with a result.
+        // Cooperative cancellation should honor the result — status must be COMPLETED, not CANCELED.
+        assertThat(execution.resultAsync(), willBe(is("completed-after-cancel")));
+        await().until(execution::stateAsync, willBe(jobStateWithStatus(COMPLETED)));
     }
 
     @ParameterizedTest
@@ -901,16 +915,28 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
         HybridTimestamp localObservableTs = currentObservableTimestamp();
         assertNotNull(localObservableTs);
 
-        JobExecution<Long> execution = submit(
+        // Capture the target node's global tracker before the job runs.
+        HybridTimestamp targetNodeTsBefore = unwrapIgniteImpl(node(1)).observableTimeTracker().get();
+
+        JobExecution<ObservableTimestampResult> execution = submit(
                 JobTarget.node(clusterNode(node(1))),
-                JobDescriptor.builder(ObservableTimestampJob.class).units(units()).build(),
+                JobDescriptor.<Void, ObservableTimestampResult>builder(jobClassName("ObservableTimestampJob"))
+                        .resultClass(ObservableTimestampResult.class)
+                        .units(units())
+                        .build(),
                 null
         );
 
-        Long jobRes = execution.resultAsync().join();
-        HybridTimestamp jobObservableTs = HybridTimestamp.nullableHybridTimestamp(jobRes);
+        ObservableTimestampResult jobRes = execution.resultAsync().join();
 
+        // The per-job tracker should have the client's observable timestamp.
+        HybridTimestamp jobObservableTs = HybridTimestamp.nullableHybridTimestamp(jobRes.perJobTimestamp());
         assertThat(jobObservableTs, is(localObservableTs));
+
+        // The node's global tracker should NOT be updated by the compute job.
+        HybridTimestamp targetNodeTsAfter = HybridTimestamp.nullableHybridTimestamp(jobRes.nodeGlobalTimestamp());
+        assertThat(targetNodeTsAfter, is(targetNodeTsBefore));
+        assertThat(targetNodeTsAfter, not(jobObservableTs));
     }
 
     protected @Nullable HybridTimestamp currentObservableTimestamp() {
@@ -941,6 +967,10 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
         return JobDescriptor.<Long, Void>builder(jobClassName("SilentSleepJob")).units(units()).build();
     }
 
+    private JobDescriptor<Long, Void> cancelAwareSleepJob() {
+        return JobDescriptor.<Long, Void>builder(jobClassName("CancelAwareSleepJob")).units(units()).build();
+    }
+
     private JobDescriptor<Void, Long> getPartitionJob() {
         return JobDescriptor.<Void, Long>builder(jobClassName("GetPartitionJob")).units(units()).build();
     }
@@ -955,6 +985,10 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
 
     private TaskDescriptor<Void, Void> infiniteMapReduceTask() {
         return TaskDescriptor.<Void, Void>builder(jobClassName("InfiniteMapReduceTask")).units(units()).build();
+    }
+
+    private JobDescriptor<Void, String> asyncDelayedCompleteJob() {
+        return JobDescriptor.<Void, String>builder(jobClassName("AsyncDelayedCompleteJob")).units(units()).build();
     }
 
     private JobDescriptor<Tuple, Integer> tupleJob() {
@@ -984,12 +1018,5 @@ public abstract class ItComputeBaseTest extends ClusterPerClassIntegrationTest {
                         either(hasMessage(containsString(CancellationException.class.getName())))
                                 .or(instanceOf(CancellationException.class))
                 );
-    }
-
-    private static class ObservableTimestampJob implements ComputeJob<Object, Long> {
-        @Override
-        public CompletableFuture<Long> executeAsync(JobExecutionContext context, Object arg) {
-            return completedFuture(unwrapIgniteImpl(context.ignite()).observableTimeTracker().getLong());
-        }
     }
 }
