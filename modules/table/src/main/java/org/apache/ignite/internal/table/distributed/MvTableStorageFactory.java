@@ -15,18 +15,22 @@
  * limitations under the License.
  */
 
-package org.apache.ignite.internal.tx.impl;
+package org.apache.ignite.internal.table.distributed;
+
+import org.apache.ignite.internal.catalog.descriptors.CatalogTableDescriptor;
+import org.apache.ignite.internal.catalog.descriptors.CatalogZoneDescriptor;
+import org.apache.ignite.internal.storage.engine.MvTableStorage;
 
 /**
- * Knows how to obtain a 32-bit nodeId needed for transactionId generation. Must return the same value for all invocations
- * run in the same Ignite instance.
+ * Factory for creating {@link MvTableStorage} instances.
  */
-@FunctionalInterface
-public interface NodeIdSupplier {
+public interface MvTableStorageFactory {
     /**
-     * Returns the node ID.
+     * Creates a new MV table storage for the given table and zone descriptors.
      *
-     * @return Node ID.
+     * @param tableDescriptor Catalog table descriptor.
+     * @param zoneDescriptor Catalog zone descriptor.
+     * @return New MV table storage.
      */
-    int nodeId();
+    MvTableStorage createMvTableStorage(CatalogTableDescriptor tableDescriptor, CatalogZoneDescriptor zoneDescriptor);
 }

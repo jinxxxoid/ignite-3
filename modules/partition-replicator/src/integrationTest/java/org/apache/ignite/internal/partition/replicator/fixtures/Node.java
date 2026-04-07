@@ -57,8 +57,6 @@ import org.apache.ignite.internal.catalog.CatalogManager;
 import org.apache.ignite.internal.catalog.CatalogManagerImpl;
 import org.apache.ignite.internal.catalog.CatalogTestUtils;
 import org.apache.ignite.internal.catalog.compaction.CatalogCompactionRunner;
-import org.apache.ignite.internal.catalog.descriptors.CatalogTableDescriptor;
-import org.apache.ignite.internal.catalog.descriptors.CatalogZoneDescriptor;
 import org.apache.ignite.internal.catalog.storage.UpdateLogImpl;
 import org.apache.ignite.internal.cluster.management.ClusterIdHolder;
 import org.apache.ignite.internal.cluster.management.ClusterInitializer;
@@ -169,6 +167,8 @@ import org.apache.ignite.internal.systemview.SystemViewManagerImpl;
 import org.apache.ignite.internal.systemview.api.SystemViewManager;
 import org.apache.ignite.internal.table.StreamerReceiverRunner;
 import org.apache.ignite.internal.table.TableTestUtils;
+import org.apache.ignite.internal.table.distributed.DefaultMvTableStorageFactory;
+import org.apache.ignite.internal.table.distributed.MvTableStorageFactory;
 import org.apache.ignite.internal.table.distributed.TableManager;
 import org.apache.ignite.internal.table.distributed.index.IndexMetaStorage;
 import org.apache.ignite.internal.table.distributed.raft.MinimumRequiredTimeCollectorService;
@@ -392,7 +392,9 @@ public class Node {
 
         ComponentWorkingDir partitionsWorkDir = partitionsPath(systemLocalConfiguration, dir);
 
-        partitionsLogStorageManager = SharedLogStorageManagerUtils.create(clusterService.nodeName(), partitionsWorkDir.raftLogPath());
+        String nodeName = clusterService.staticLocalNode().name();
+
+        partitionsLogStorageManager = SharedLogStorageManagerUtils.create(nodeName, partitionsWorkDir.raftLogPath());
 
         LogSyncer partitionsLogSyncer = partitionsLogStorageManager.logSyncer();
 
@@ -424,8 +426,7 @@ public class Node {
 
         ComponentWorkingDir cmgWorkDir = new ComponentWorkingDir(dir.resolve("cmg"));
 
-        cmgLogStorageManager =
-                SharedLogStorageManagerUtils.create(clusterService.nodeName(), cmgWorkDir.raftLogPath());
+        cmgLogStorageManager = SharedLogStorageManagerUtils.create(nodeName, cmgWorkDir.raftLogPath());
 
         RaftGroupOptionsConfigurer cmgRaftConfigurer =
                 RaftGroupOptionsConfigHelper.configureProperties(cmgLogStorageManager, cmgWorkDir.metaPath());
@@ -467,14 +468,13 @@ public class Node {
 
         ComponentWorkingDir metastorageWorkDir = new ComponentWorkingDir(dir.resolve("metastorage"));
 
-        msLogStorageManager =
-                SharedLogStorageManagerUtils.create(clusterService.nodeName(), metastorageWorkDir.raftLogPath());
+        msLogStorageManager = SharedLogStorageManagerUtils.create(nodeName, metastorageWorkDir.raftLogPath());
 
         RaftGroupOptionsConfigurer msRaftConfigurer =
                 RaftGroupOptionsConfigHelper.configureProperties(msLogStorageManager, metastorageWorkDir.metaPath());
 
         metaStorageManager = new MetaStorageManagerImpl(
-                clusterService,
+                clusterService.staticLocalNode(),
                 cmgManager,
                 logicalTopologyService,
                 raftManager,
@@ -661,7 +661,6 @@ public class Node {
         var validationSchemasSource = new CatalogValidationSchemasSource(catalogManager, schemaManager, indexMetaStorage);
 
         replicaManager = new ReplicaManager(
-                name,
                 clusterService,
                 cmgManager,
                 groupId -> completedFuture(Assignments.EMPTY),
@@ -689,7 +688,7 @@ public class Node {
         MinimumRequiredTimeCollectorService minTimeCollectorService = new MinimumRequiredTimeCollectorServiceImpl();
 
         catalogCompactionRunner = new CatalogCompactionRunner(
-                name,
+                clusterService.staticLocalNode(),
                 (CatalogManagerImpl) catalogManager,
                 clusterService.messagingService(),
                 logicalTopologyService,
@@ -697,7 +696,6 @@ public class Node {
                 replicaSvc,
                 clockService,
                 schemaSyncService,
-                clusterService.topologyService(),
                 lowWatermark,
                 clockService::nowLong,
                 minTimeCollectorService,
@@ -709,8 +707,7 @@ public class Node {
                 clusterConfigRegistry.getConfiguration(SystemDistributedExtensionConfiguration.KEY).system();
 
         distributionZoneManager = new DistributionZoneManager(
-                name,
-                () -> clusterService.topologyService().localMember().id(),
+                clusterService.staticLocalNode(),
                 metaStorageManager,
                 logicalTopologyService,
                 catalogManager,
@@ -737,6 +734,7 @@ public class Node {
                 distributionZoneManager,
                 metaStorageManager,
                 clusterService.topologyService(),
+                clusterService.staticLocalNode(),
                 lowWatermark,
                 failureManager,
                 threadPoolsManager.tableIoExecutor(),
@@ -771,7 +769,7 @@ public class Node {
         );
 
         tableManager = new TableManager(
-                name,
+                clusterService.staticLocalNode(),
                 registry,
                 gcConfiguration,
                 replicationConfiguration,
@@ -802,30 +800,9 @@ public class Node {
                 minTimeCollectorService,
                 systemDistributedConfiguration,
                 metricManager,
-                TableTestUtils.NOOP_PARTITION_MODIFICATION_COUNTER_FACTORY
-        ) {
-
-            @Override
-            protected MvTableStorage createTableStorage(CatalogTableDescriptor tableDescriptor, CatalogZoneDescriptor zoneDescriptor) {
-                MvTableStorage storage = createSpy(super.createTableStorage(tableDescriptor, zoneDescriptor));
-
-                var partitionStorages = new ConcurrentHashMap<Integer, MvPartitionStorage>();
-
-                doAnswer(invocation -> {
-                    Integer partitionId = invocation.getArgument(0);
-
-                    return partitionStorages.computeIfAbsent(partitionId, id -> {
-                        try {
-                            return (MvPartitionStorage) createSpy(invocation.callRealMethod());
-                        } catch (Throwable e) {
-                            throw new RuntimeException(e);
-                        }
-                    });
-                }).when(storage).getMvPartition(anyInt());
-
-                return storage;
-            }
-        };
+                TableTestUtils.NOOP_PARTITION_MODIFICATION_COUNTER_FACTORY,
+                spyingMvTableStorageFactory(new DefaultMvTableStorageFactory(dataStorageMgr, catalogManager, lowWatermark))
+        );
 
         tableManager.setStreamerReceiverRunner(mock(StreamerReceiverRunner.class));
 
@@ -1050,6 +1027,28 @@ public class Node {
 
         assertThat(primaryReplicaFuture, willCompleteSuccessfully());
         return primaryReplicaFuture.join();
+    }
+
+    private static MvTableStorageFactory spyingMvTableStorageFactory(MvTableStorageFactory delegate) {
+        return (tableDesc, zoneDesc) -> {
+            MvTableStorage storage = createSpy(delegate.createMvTableStorage(tableDesc, zoneDesc));
+
+            var partitionStorages = new ConcurrentHashMap<Integer, MvPartitionStorage>();
+
+            doAnswer(invocation -> {
+                Integer partitionId = invocation.getArgument(0);
+
+                return partitionStorages.computeIfAbsent(partitionId, id -> {
+                    try {
+                        return (MvPartitionStorage) createSpy(invocation.callRealMethod());
+                    } catch (Throwable e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }).when(storage).getMvPartition(anyInt());
+
+            return storage;
+        };
     }
 
     @Contract("null -> null")
